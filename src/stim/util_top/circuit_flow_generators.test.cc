@@ -7,6 +7,8 @@
 #include "stim/mem/simd_word.test.h"
 #include "stim/util_top/circuit_inverse_qec.h"
 #include "stim/util_top/has_flow.h"
+#include "stim/util_top/missing_detectors.h"
+#include "stim/simulators/error_analyzer.h"
 
 using namespace stim;
 
@@ -270,6 +272,71 @@ TEST_EACH_WORD_SIZE_W(circuit_flow_generators, various, {
         }));
 })
 
+TEST_EACH_WORD_SIZE_W(circuit_flow_generators, repeated_measure_reset, {
+    for (const auto &[gate, axis] :
+         std::vector<std::pair<std::string, std::string>>{{"MR", "Z"}, {"MRX", "X"}, {"MRY", "Y"}}) {
+        for (const auto &targets : std::vector<std::string>{"0 0", "!0 0", "0 !0", "!0 !0"}) {
+            SCOPED_TRACE(gate + " " + targets);
+            bool first_inverted = targets[0] == '!';
+            bool second_inverted = targets[targets.find(' ') + 1] == '!';
+            std::vector<Flow<W>> expected{
+                Flow<W>::from_str("1 -> " + axis),
+                Flow<W>::from_str(std::string("1 -> ") + (second_inverted ? "-" : "") + "rec[1]"),
+                Flow<W>::from_str(axis + " -> " + (first_inverted ? "-" : "") + "rec[0]"),
+            };
+            std::sort(expected.begin(), expected.end());
+            EXPECT_EQ(circuit_flow_generators<W>(Circuit(gate + " " + targets)), expected);
+        }
+
+        Circuit bundled(gate + " 0 1 !0 !1 0");
+        Circuit split(
+            gate + " 0\nTICK\n" + gate + " 1\nTICK\n" + gate + " !0\nTICK\n" + gate + " !1\nTICK\n" + gate + " 0");
+        EXPECT_EQ(circuit_flow_generators<W>(bundled), circuit_flow_generators<W>(split));
+
+        std::vector<Flow<W>> disjoint_expected{
+            Flow<W>::from_str("1 -> " + axis + "_"),
+            Flow<W>::from_str("1 -> _" + axis),
+            Flow<W>::from_str(axis + "_ -> rec[0]"),
+            Flow<W>::from_str("_" + axis + " -> rec[1]"),
+        };
+        std::sort(disjoint_expected.begin(), disjoint_expected.end());
+        Circuit disjoint(gate + " 0 1");
+        EXPECT_EQ(circuit_flow_generators<W>(disjoint), disjoint_expected);
+        EXPECT_EQ(
+            solve_for_flow_measurements<W>(
+                disjoint,
+                std::vector<Flow<W>>{Flow<W>::from_str(axis + "_ -> 1"), Flow<W>::from_str("_" + axis + " -> 1")}),
+            (std::vector<std::optional<std::vector<int32_t>>>{{std::vector<int32_t>{0}}, {std::vector<int32_t>{1}}}));
+
+        const std::string prefix = "H 0\nS 1\nCX 0 1\n";
+        EXPECT_EQ(
+            circuit_flow_generators<W>(Circuit(prefix + gate + " 0 1 !0 !1 0")),
+            circuit_flow_generators<W>(Circuit(
+                prefix + gate + " 0\nTICK\n" + gate + " 1\nTICK\n" + gate + " !0\nTICK\n" + gate + " !1\nTICK\n" +
+                gate + " 0")));
+
+        Circuit circuit(gate + " 0 0");
+        std::vector<Flow<W>> requested{Flow<W>::from_str(axis + " -> 1")};
+        auto solved = solve_for_flow_measurements<W>(circuit, requested);
+        ASSERT_EQ(solved.size(), 1);
+        ASSERT_TRUE(solved[0].has_value());
+        requested[0].measurements = *solved[0];
+        EXPECT_EQ(check_if_circuit_has_unsigned_stabilizer_flows<W>(circuit, requested), (std::vector<bool>{true}));
+    }
+})
+
+TEST_EACH_WORD_SIZE_W(circuit_flow_generators, asymmetric_padding, {
+    EXPECT_EQ(
+        circuit_flow_generators<W>(Circuit("MPAD 1 0")),
+        (std::vector<Flow<W>>{Flow<W>::from_str("1 -> rec[1]"), Flow<W>::from_str("1 -> -rec[0]")}));
+    EXPECT_EQ(
+        circuit_flow_generators<W>(Circuit("MPAD 0 1")),
+        (std::vector<Flow<W>>{Flow<W>::from_str("1 -> rec[0]"), Flow<W>::from_str("1 -> -rec[1]")}));
+    EXPECT_EQ(
+        circuit_flow_generators<W>(Circuit("MPAD 1 0 0")),
+        circuit_flow_generators<W>(Circuit("MPAD 1\nTICK\nMPAD 0\nTICK\nMPAD 0")));
+})
+
 TEST_EACH_WORD_SIZE_W(circuit_flow_generators, all_operations, {
     auto circuit = generate_test_circuit_with_all_operations();
     auto generators = circuit_flow_generators<W>(circuit);
@@ -279,6 +346,18 @@ TEST_EACH_WORD_SIZE_W(circuit_flow_generators, all_operations, {
         EXPECT_TRUE(passes[k]) << k << ": " << generators[k];
     }
 })
+
+TEST(circuit_flow_generators, repeated_reset_detector_completion) {
+    Circuit circuit("H 0\nMR 0 0");
+    Circuit detectors = missing_detectors(circuit, true);
+    EXPECT_EQ(detectors, Circuit("DETECTOR rec[-1]"));
+    circuit += detectors;
+    EXPECT_NO_THROW(ErrorAnalyzer::circuit_to_detector_error_model(circuit, false, false, false, 0, false, false));
+    Circuit invalid("H 0\nMR 0 0\nDETECTOR rec[-2] rec[-1]");
+    EXPECT_THROW(
+        ErrorAnalyzer::circuit_to_detector_error_model(invalid, false, false, false, 0, false, false),
+        std::invalid_argument);
+}
 
 TEST_EACH_WORD_SIZE_W(solve_for_flow_measurements, empty, {
     EXPECT_EQ(

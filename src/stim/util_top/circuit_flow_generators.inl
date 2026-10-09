@@ -166,9 +166,13 @@ void CircuitFlowGeneratorSolver<W>::mult_row_into(size_t src_row, size_t dst_row
 
 template <size_t W>
 void CircuitFlowGeneratorSolver<W>::undo_mrb(CircuitInstruction inst, bool x, bool z) {
-    check_for_1q_anticommutations(inst, x, z);
-    remove_single_qubit_reset_terms(inst);
-    add_1q_measure_terms(inst, x, z);
+    // Preserve intermediate resets when a bundled instruction repeats a target.
+    for (size_t k = inst.targets.size(); k--;) {
+        CircuitInstruction single{inst.gate_type, inst.args, inst.targets.sub(k, k + 1), inst.tag};
+        check_for_1q_anticommutations(single, x, z);
+        remove_single_qubit_reset_terms(single);
+        add_1q_measure_terms(single, x, z);
+    }
 }
 template <size_t W>
 void CircuitFlowGeneratorSolver<W>::undo_mb(CircuitInstruction inst, bool x, bool z) {
@@ -279,7 +283,8 @@ void CircuitFlowGeneratorSolver<W>::undo_instruction(CircuitInstruction inst) {
 
         case GateType::MPAD:
             // Pads.
-            for (auto t : inst.targets) {
+            for (size_t k = inst.targets.size(); k--;) {
+                auto t = inst.targets[k];
                 num_measurements_in_past--;
                 if (!t.is_qubit_target()) {
                     throw std::invalid_argument("Bad target in " + inst.str());
